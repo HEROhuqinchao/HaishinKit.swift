@@ -1,20 +1,11 @@
 import AVFoundation
 import CoreImage
 
-final class VideoIOComponent: IOComponent {
-    #if os(macOS)
+final class AVVideoIOUnit: NSObject, AVIOUnit {
     static let defaultAttributes: [NSString: NSObject] = [
         kCVPixelBufferPixelFormatTypeKey: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-        kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue,
-        kCVPixelBufferOpenGLCompatibilityKey: kCFBooleanTrue
+        kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue
     ]
-    #else
-    static let defaultAttributes: [NSString: NSObject] = [
-        kCVPixelBufferPixelFormatTypeKey: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-        kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue,
-        kCVPixelBufferOpenGLESCompatibilityKey: kCFBooleanTrue
-    ]
-    #endif
 
     let lockQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.VideoIOComponent.lock")
 
@@ -41,13 +32,17 @@ final class VideoIOComponent: IOComponent {
             decoder.formatDescription = formatDescription
         }
     }
-    lazy var encoder = H264Encoder()
-    lazy var decoder = H264Decoder()
-    lazy var queue: DisplayLinkedQueue = {
-        let queue = DisplayLinkedQueue()
-        queue.delegate = self
-        return queue
+    lazy var encoder: VideoCodec = {
+        var encoder = VideoCodec()
+        encoder.lockQueue = lockQueue
+        return encoder
     }()
+    lazy var decoder: H264Decoder = {
+        var decoder = H264Decoder()
+        decoder.delegate = self
+        return decoder
+    }()
+    weak var mixer: AVMixer?
 
     private(set) var effects: Set<VideoEffect> = []
 
@@ -61,7 +56,7 @@ final class VideoIOComponent: IOComponent {
     }
 
     private var attributes: [NSString: NSObject] {
-        var attributes: [NSString: NSObject] = VideoIOComponent.defaultAttributes
+        var attributes: [NSString: NSObject] = Self.defaultAttributes
         attributes[kCVPixelBufferWidthKey] = NSNumber(value: Int(extent.width))
         attributes[kCVPixelBufferHeightKey] = NSNumber(value: Int(extent.height))
         return attributes
@@ -295,10 +290,18 @@ final class VideoIOComponent: IOComponent {
     }
     #endif
 
-    override init(mixer: AVMixer) {
-        super.init(mixer: mixer)
-        encoder.lockQueue = lockQueue
-        decoder.delegate = self
+    deinit {
+        if Thread.isMainThread {
+            self.renderer?.attachStream(nil)
+        } else {
+            DispatchQueue.main.sync {
+                self.renderer?.attachStream(nil)
+            }
+        }
+        #if os(iOS) || os(macOS)
+        input = nil
+        output = nil
+        #endif
     }
 
     #if os(iOS) || os(macOS)
@@ -359,29 +362,6 @@ final class VideoIOComponent: IOComponent {
             logger.error("while setting torch: \(error)")
         }
     }
-
-    func dispose() {
-        if Thread.isMainThread {
-            self.renderer?.attachStream(nil)
-        } else {
-            DispatchQueue.main.sync {
-                self.renderer?.attachStream(nil)
-            }
-        }
-
-        input = nil
-        output = nil
-    }
-    #else
-    func dispose() {
-        if Thread.isMainThread {
-            self.renderer?.attachStream(nil)
-        } else {
-            DispatchQueue.main.sync {
-                self.renderer?.attachStream(nil)
-            }
-        }
-    }
     #endif
 
     @inline(__always)
@@ -404,7 +384,7 @@ final class VideoIOComponent: IOComponent {
     }
 }
 
-extension VideoIOComponent {
+extension AVVideoIOUnit {
     func encodeSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
         guard let buffer: CVImageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             return
@@ -436,7 +416,7 @@ extension VideoIOComponent {
                 }
                 context?.render(image, to: imageBuffer ?? buffer)
             }
-            renderer?.render(image: image)
+            renderer?.enqueue(sampleBuffer)
         }
 
         encoder.encodeImageBuffer(
@@ -449,24 +429,18 @@ extension VideoIOComponent {
     }
 }
 
-extension VideoIOComponent {
+extension AVVideoIOUnit {
     func startDecoding() {
-        queue.startRunning()
         decoder.startRunning()
     }
 
     func stopDecoding() {
         decoder.stopRunning()
-        queue.stopRunning()
-        renderer?.render(image: nil)
-    }
-
-    func decodeSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-        _ = decoder.decodeSampleBuffer(sampleBuffer)
+        renderer?.enqueue(nil)
     }
 }
 
-extension VideoIOComponent: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension AVVideoIOUnit: AVCaptureVideoDataOutputSampleBufferDelegate {
     // MARK: AVCaptureVideoDataOutputSampleBufferDelegate
     func captureOutput(_ captureOutput: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         #if os(macOS)
@@ -474,28 +448,13 @@ extension VideoIOComponent: AVCaptureVideoDataOutputSampleBufferDelegate {
             sampleBuffer.reflectHorizontal()
         }
         #endif
-
         encodeSampleBuffer(sampleBuffer)
     }
 }
 
-extension VideoIOComponent: VideoDecoderDelegate {
+extension AVVideoIOUnit: VideoDecoderDelegate {
     // MARK: VideoDecoderDelegate
     func sampleOutput(video sampleBuffer: CMSampleBuffer) {
-        queue.enqueue(sampleBuffer)
-    }
-}
-
-extension VideoIOComponent: DisplayLinkedQueueDelegate {
-    // MARK: DisplayLinkedQueue
-    func queue(_ buffer: CMSampleBuffer) {
-        renderer?.render(image: CIImage(cvPixelBuffer: buffer.imageBuffer!))
-        if let mixer = mixer {
-            mixer.delegate?.mixer(mixer, didOutput: buffer)
-        }
-    }
-
-    func empty() {
-        mixer?.didBufferEmpty(self)
+        renderer?.enqueue(sampleBuffer)
     }
 }
