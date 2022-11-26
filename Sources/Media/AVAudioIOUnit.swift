@@ -19,84 +19,48 @@ final class AVAudioIOUnit: NSObject, AVIOUnit {
         }
     }
     weak var mixer: AVMixer?
+    var muted = false
 
-#if os(iOS) || os(macOS)
-    var input: AVCaptureDeviceInput? {
+    #if os(iOS) || os(macOS)
+    var capture: AVCaptureIOUnit<AVCaptureAudioDataOutput>? {
         didSet {
-            guard let mixer: AVMixer = mixer, oldValue != input else {
-                return
-            }
-            if let oldValue: AVCaptureDeviceInput = oldValue {
-                mixer.session.removeInput(oldValue)
-            }
-            if let input: AVCaptureDeviceInput = input, mixer.session.canAddInput(input) {
-                mixer.session.addInput(input)
-            }
+            oldValue?.output.setSampleBufferDelegate(nil, queue: nil)
+            oldValue?.detach(mixer?.session)
         }
     }
-
-    private var _output: AVCaptureAudioDataOutput?
-    var output: AVCaptureAudioDataOutput! {
-        get {
-            if _output == nil {
-                _output = AVCaptureAudioDataOutput()
-            }
-            return _output
-        }
-        set {
-            if _output == newValue {
-                return
-            }
-            if let output: AVCaptureAudioDataOutput = _output {
-                output.setSampleBufferDelegate(nil, queue: nil)
-                mixer?.session.removeOutput(output)
-            }
-            _output = newValue
-        }
-    }
-#endif
+    #endif
 
     private var audioFormat: AVAudioFormat?
 
-#if os(iOS) || os(macOS)
+    #if os(iOS) || os(macOS)
     deinit {
-        input = nil
-        output = nil
+        capture = nil
     }
-#endif
+    #endif
 
-    func appendSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-        mixer?.recorder.appendSampleBuffer(sampleBuffer, mediaType: .audio)
-        codec.encodeSampleBuffer(sampleBuffer)
-    }
-
-#if os(iOS) || os(macOS)
+    #if os(iOS) || os(macOS)
     func attachAudio(_ audio: AVCaptureDevice?, automaticallyConfiguresApplicationAudioSession: Bool) throws {
-        guard let mixer: AVMixer = mixer else {
+        guard let mixer = mixer else {
             return
         }
-
         mixer.session.beginConfiguration()
         defer {
             mixer.session.commitConfiguration()
         }
-
-        output = nil
         codec.invalidate()
-
         guard let audio: AVCaptureDevice = audio else {
-            input = nil
+            capture = nil
             return
         }
-
-        input = try AVCaptureDeviceInput(device: audio)
+        capture = AVCaptureIOUnit(try AVCaptureDeviceInput(device: audio)) {
+            AVCaptureAudioDataOutput()
+        }
         #if os(iOS)
         mixer.session.automaticallyConfiguresApplicationAudioSession = automaticallyConfiguresApplicationAudioSession
         #endif
-        mixer.session.addOutput(output)
-        output.setSampleBufferDelegate(self, queue: lockQueue)
+        capture?.output.setSampleBufferDelegate(self, queue: lockQueue)
     }
-#endif
+    #endif
 
     func registerEffect(_ effect: AudioEffect) -> Bool {
         codec.effects.insert(effect).inserted
@@ -106,10 +70,34 @@ final class AVAudioIOUnit: NSObject, AVIOUnit {
         codec.effects.remove(effect) != nil
     }
 
-    func startDecoding(_ audioEngine: AVAudioEngine?) {
+    func appendSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        guard let sampleBuffer = sampleBuffer.muted(muted) else {
+            return
+        }
+        mixer?.recorder.appendSampleBuffer(sampleBuffer, mediaType: .audio)
+        codec.encodeSampleBuffer(sampleBuffer)
+    }
+}
+
+extension AVAudioIOUnit: AVIOUnitEncoding {
+    // MARK: AVIOUnitEncoding
+    func startEncoding(_ delegate: AVCodecDelegate) {
+        codec.delegate = delegate
+        codec.startRunning()
+    }
+
+    func stopEncoding() {
+        codec.stopRunning()
+        codec.delegate = nil
+    }
+}
+
+extension AVAudioIOUnit: AVIOUnitDecoding {
+    // MARK: AVIOUnitDecoding
+    func startDecoding(_ audioEngine: AVAudioEngine) {
         self.audioEngine = audioEngine
         if let playerNode = mixer?.mediaLink.playerNode {
-            audioEngine?.attach(playerNode)
+            audioEngine.attach(playerNode)
         }
         codec.delegate = self
         codec.startRunning()
@@ -120,17 +108,22 @@ final class AVAudioIOUnit: NSObject, AVIOUnit {
             audioEngine?.detach(playerNode)
         }
         audioEngine = nil
-        codec.delegate = nil
         codec.stopRunning()
+        codec.delegate = nil
     }
 }
 
+#if os(iOS) || os(macOS)
 extension AVAudioIOUnit: AVCaptureAudioDataOutputSampleBufferDelegate {
     // MARK: AVCaptureAudioDataOutputSampleBufferDelegate
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard mixer?.useSampleBuffer(sampleBuffer: sampleBuffer, mediaType: AVMediaType.audio) == true else {
+            return
+        }
         appendSampleBuffer(sampleBuffer)
     }
 }
+#endif
 
 extension AVAudioIOUnit: AudioCodecDelegate {
     // MARK: AudioConverterDelegate
@@ -148,7 +141,7 @@ extension AVAudioIOUnit: AudioCodecDelegate {
             audioFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: asbd.mSampleRate, channels: asbd.mChannelsPerFrame, interleaved: false)
         }
         #else
-            audioFormat = AVAudioFormat(cmAudioFormatDescription: formatDescription)
+        audioFormat = AVAudioFormat(cmAudioFormatDescription: formatDescription)
         #endif
         nstry({
             if let plyerNode = self.mixer?.mediaLink.playerNode, let audioFormat = self.audioFormat {

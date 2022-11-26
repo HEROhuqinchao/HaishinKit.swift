@@ -13,11 +13,8 @@
 # Uncomment the line if you want fastlane to automatically update itself
 # update_fastlane
 
-default_platform(:ios)
-
-platform :ios do
-  desc "Description of what the lane does"
-  lane :review do
-    sh("cd .. && bundle exec pod lib lint --allow-warnings")
-  end
+desc "[CI] Review PullRequest."
+lane :review do
+  sh('xcodebuild', '-version')
+  spm()
 end
