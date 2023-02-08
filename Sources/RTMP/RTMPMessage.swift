@@ -422,7 +422,7 @@ final class RTMPDataMessage: RTMPMessage {
     }
 
     override func execute(_ connection: RTMPConnection, type: RTMPChunkType) {
-        guard let stream: RTMPStream = connection.streams[streamId] else {
+        guard let stream = connection.streams.first(where: { $0.id == streamId }) else {
             return
         }
         stream.info.byteCount.mutate { $0 += Int64(payload.count) }
@@ -564,16 +564,21 @@ final class RTMPAudioMessage: RTMPMessage {
     }
 
     override func execute(_ connection: RTMPConnection, type: RTMPChunkType) {
-        guard let stream: RTMPStream = connection.streams[streamId] else {
+        guard let stream = connection.streams.first(where: { $0.id == streamId }) else {
             return
         }
         stream.info.byteCount.mutate { $0 += Int64(payload.count) }
         guard codec.isSupported else {
             return
         }
+        var duration = Int64(timestamp)
         switch type {
         case .zero:
-            stream.audioTimestamp = Double(timestamp)
+            if stream.audioTimestampZero == -1 {
+                stream.audioTimestampZero = Double(timestamp)
+            }
+            duration -= Int64(stream.audioTimestamp)
+            stream.audioTimestamp = Double(timestamp) - stream.audioTimestampZero
         default:
             stream.audioTimestamp += Double(timestamp)
         }
@@ -624,7 +629,7 @@ final class RTMPVideoMessage: RTMPMessage {
     }
 
     override func execute(_ connection: RTMPConnection, type: RTMPChunkType) {
-        guard let stream: RTMPStream = connection.streams[streamId] else {
+        guard let stream = connection.streams.first(where: { $0.id == streamId }) else {
             return
         }
         stream.info.byteCount.mutate { $0 += Int64(payload.count) }
@@ -651,15 +656,20 @@ final class RTMPVideoMessage: RTMPMessage {
         compositionTime <<= 8
         compositionTime /= 256
 
+        var duration = Int64(timestamp)
         switch type {
         case .zero:
-            stream.videoTimestamp = Double(timestamp)
+            if stream.videoTimestampZero == -1 {
+                stream.videoTimestampZero = Double(timestamp)
+            }
+            duration -= Int64(stream.videoTimestamp)
+            stream.videoTimestamp = Double(timestamp) - stream.videoTimestampZero
         default:
             stream.videoTimestamp += Double(timestamp)
         }
 
         var timing = CMSampleTimingInfo(
-            duration: CMTimeMake(value: Int64(timestamp), timescale: 1000),
+            duration: CMTimeMake(value: duration, timescale: 1000),
             presentationTimeStamp: CMTimeMake(value: Int64(stream.videoTimestamp) + Int64(compositionTime), timescale: 1000),
             decodeTimeStamp: .invalid
         )
@@ -798,11 +808,11 @@ final class RTMPUserControlMessage: RTMPMessage {
                 type: .zero,
                 streamId: RTMPChunk.StreamID.control.rawValue,
                 message: RTMPUserControlMessage(event: .pong, value: value)
-            ), locked: nil)
+            ))
         case .bufferEmpty:
-            connection.streams[UInt32(value)]?.dispatch(.rtmpStatus, bubbles: false, data: RTMPStream.Code.bufferEmpty.data(""))
+            connection.streams.first(where: { $0.id == UInt32(value) })?.dispatch(.rtmpStatus, bubbles: false, data: RTMPStream.Code.bufferEmpty.data(""))
         case .bufferFull:
-            connection.streams[UInt32(value)]?.dispatch(.rtmpStatus, bubbles: false, data: RTMPStream.Code.bufferFull.data(""))
+            connection.streams.first(where: { $0.id == UInt32(value) })?.dispatch(.rtmpStatus, bubbles: false, data: RTMPStream.Code.bufferFull.data(""))
         default:
             break
         }

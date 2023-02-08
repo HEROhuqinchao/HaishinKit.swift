@@ -33,6 +33,27 @@ public class VideoCodec {
     #endif
     #endif
 
+    /// A bitRate mode that affectes how to encode the video source.
+    public enum BitRateMode {
+        /// The average bit rate.
+        case average
+        /// The constant bit rate.
+        @available(iOS 16.0, tvOS 16.0, macOS 13.0, *)
+        case constant
+
+        var key: VTSessionOptionKey {
+            if #available(iOS 16.0, tvOS 16.0, macOS 13.0, *) {
+                switch self {
+                case .average:
+                    return .averageBitRate
+                case .constant:
+                    return .constantBitRate
+                }
+            }
+            return .averageBitRate
+        }
+    }
+
     /**
      * The VideoCodec error domain codes.
      */
@@ -67,7 +88,10 @@ public class VideoCodec {
         case maxKeyFrameIntervalDuration
         /// Specifies the scalingMode.
         case scalingMode
+        /// Specifies the allowFrameRecording.
         case allowFrameReordering
+        /// Specifies the bitRateMode.
+        case bitRateMode
 
         public var keyPath: AnyKeyPath {
             switch self {
@@ -89,6 +113,8 @@ public class VideoCodec {
                 return \VideoCodec.profileLevel
             case .allowFrameReordering:
                 return \VideoCodec.allowFrameReordering
+            case .bitRateMode:
+                return \VideoCodec.bitRateMode
             }
         }
     }
@@ -106,7 +132,6 @@ public class VideoCodec {
         kCVPixelBufferIOSurfacePropertiesKey: [:] as AnyObject,
         kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue
     ]
-
     /// Specifies the settings for a VideoCodec.
     public var settings: Setting<VideoCodec, Option> = [:] {
         didSet {
@@ -119,6 +144,15 @@ public class VideoCodec {
     var scalingMode = VideoCodec.defaultScalingMode {
         didSet {
             guard scalingMode != oldValue else {
+                return
+            }
+            invalidateSession = true
+        }
+    }
+
+    var bitRateMode: BitRateMode = .average {
+        didSet {
+            guard bitRateMode != oldValue else {
                 return
             }
             invalidateSession = true
@@ -156,7 +190,7 @@ public class VideoCodec {
             guard bitrate != oldValue else {
                 return
             }
-            let option = VTSessionOption(key: .averageBitRate, value: NSNumber(value: bitrate))
+            let option = VTSessionOption(key: bitRateMode.key, value: NSNumber(value: bitrate))
             if let status = session?.setOption(option), status != noErr {
                 delegate?.videoCodec(self, errorOccurred: .failedToSetOption(status: status, option: option))
             }
@@ -187,9 +221,8 @@ public class VideoCodec {
             invalidateSession = true
         }
     }
-    var locked: UInt32 = 0
     var lockQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.VideoCodec.lock")
-    var expectedFrameRate = AVMixer.defaultFPS {
+    var expectedFrameRate = IOMixer.defaultFrameRate {
         didSet {
             guard expectedFrameRate != oldValue else {
                 return
@@ -244,7 +277,7 @@ public class VideoCodec {
     }
 
     func inputBuffer(_ imageBuffer: CVImageBuffer, presentationTimeStamp: CMTime, duration: CMTime) {
-        guard isRunning.value && locked == 0 else {
+        guard isRunning.value else {
             return
         }
         if invalidateSession {
@@ -256,11 +289,11 @@ public class VideoCodec {
             duration: duration
         ) { [unowned self] status, _, sampleBuffer in
             guard let sampleBuffer, status == noErr else {
-                self.delegate?.videoCodec(self, errorOccurred: .failedToFlame(status: status))
+                delegate?.videoCodec(self, errorOccurred: .failedToFlame(status: status))
                 return
             }
-            self.formatDescription = sampleBuffer.formatDescription
-            self.delegate?.videoCodec(self, didOutput: sampleBuffer)
+            formatDescription = sampleBuffer.formatDescription
+            delegate?.videoCodec(self, didOutput: sampleBuffer)
         }
     }
 
@@ -292,7 +325,7 @@ public class VideoCodec {
             )
 
             guard status == noErr else {
-                self.delegate?.videoCodec(self, errorOccurred: .failedToFlame(status: status))
+                delegate?.videoCodec(self, errorOccurred: .failedToFlame(status: status))
                 return
             }
 
@@ -309,19 +342,19 @@ public class VideoCodec {
             )
 
             guard let buffer = sampleBuffer, status == noErr else {
-                self.delegate?.videoCodec(self, errorOccurred: .failedToFlame(status: status))
+                delegate?.videoCodec(self, errorOccurred: .failedToFlame(status: status))
                 return
             }
 
-            if self.isBaseline {
-                self.delegate?.videoCodec(self, didOutput: buffer)
+            if isBaseline {
+                delegate?.videoCodec(self, didOutput: buffer)
             } else {
-                self.buffers.append(buffer)
-                self.buffers.sort {
+                buffers.append(buffer)
+                buffers.sort {
                     $0.presentationTimeStamp < $1.presentationTimeStamp
                 }
-                if self.minimumGroupOfPictures <= buffers.count {
-                    self.delegate?.videoCodec(self, didOutput: buffer)
+                if minimumGroupOfPictures <= buffers.count {
+                    delegate?.videoCodec(self, didOutput: buffers.removeFirst())
                 }
             }
         }
@@ -332,7 +365,7 @@ public class VideoCodec {
         var options = Set<VTSessionOption>([
             .init(key: .realTime, value: kCFBooleanTrue),
             .init(key: .profileLevel, value: profileLevel as NSObject),
-            .init(key: .averageBitRate, value: NSNumber(value: bitrate)),
+            .init(key: bitRateMode.key, value: NSNumber(value: bitrate)),
             .init(key: .expectedFrameRate, value: NSNumber(value: expectedFrameRate)),
             .init(key: .maxKeyFrameIntervalDuration, value: NSNumber(value: maxKeyFrameIntervalDuration)),
             .init(key: .allowFrameReordering, value: (allowFrameReordering ?? !isBaseline) as NSObject),
@@ -382,7 +415,6 @@ extension VideoCodec: Running {
     public func startRunning() {
         lockQueue.async {
             self.isRunning.mutate { $0 = true }
-            OSAtomicAnd32Barrier(0, &self.locked)
             #if os(iOS)
             NotificationCenter.default.addObserver(
                 self,
