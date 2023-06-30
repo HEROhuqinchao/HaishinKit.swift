@@ -10,36 +10,27 @@ final class IOAudioUnit: NSObject, IOUnit {
         codec.lockQueue = lockQueue
         return codec
     }()
-
     let lockQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.AudioIOComponent.lock")
-
-    var audioEngine: AVAudioEngine?
     var soundTransform: SoundTransform = .init() {
         didSet {
             soundTransform.apply(mixer?.mediaLink.playerNode)
         }
     }
-    weak var mixer: IOMixer?
     var muted = false
-
+    weak var mixer: IOMixer?
     #if os(iOS) || os(macOS)
-    var capture: IOAudioCaptureUnit? {
+    private(set) var capture: IOAudioCaptureUnit = .init()
+    #endif
+    private var inSourceFormat: AudioStreamBasicDescription? {
         didSet {
-            oldValue?.setSampleBufferDelegate(nil)
-            oldValue?.detachSession(mixer?.session)
-            capture?.attachSession(mixer?.session)
-            capture?.setSampleBufferDelegate(self)
+            guard inSourceFormat != oldValue else {
+                return
+            }
+            presentationTimeStamp = .invalid
+            codec.inSourceFormat = inSourceFormat
         }
     }
-    #endif
-
-    private var audioFormat: AVAudioFormat?
-
-    #if os(iOS) || os(macOS)
-    deinit {
-        capture = nil
-    }
-    #endif
+    private var presentationTimeStamp: CMTime = .invalid
 
     #if os(iOS) || os(macOS)
     func attachAudio(_ device: AVCaptureDevice?, automaticallyConfiguresApplicationAudioSession: Bool) throws {
@@ -50,17 +41,29 @@ final class IOAudioUnit: NSObject, IOUnit {
         defer {
             mixer.session.commitConfiguration()
         }
-        codec.invalidate()
         guard let device else {
-            self.capture = nil
+            try capture.attachDevice(nil, audioUnit: self)
             return
         }
-        self.capture = try IOAudioCaptureUnit(device)
+        try capture.attachDevice(device, audioUnit: self)
         #if os(iOS)
         mixer.session.automaticallyConfiguresApplicationAudioSession = automaticallyConfiguresApplicationAudioSession
         #endif
     }
     #endif
+
+    func appendSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        guard CMSampleBufferDataIsReady(sampleBuffer), let sampleBuffer = sampleBuffer.muted(muted) else {
+            return
+        }
+        inSourceFormat = sampleBuffer.formatDescription?.streamBasicDescription?.pointee
+        if isFragmented(sampleBuffer), let sampleBuffer = makeSampleBuffer(sampleBuffer) {
+            appendSampleBuffer(sampleBuffer)
+        }
+        mixer?.recorder.appendSampleBuffer(sampleBuffer)
+        codec.appendSampleBuffer(sampleBuffer)
+        presentationTimeStamp = CMTimeAdd(presentationTimeStamp, CMTime(value: CMTimeValue(sampleBuffer.numSamples), timescale: presentationTimeStamp.timescale))
+    }
 
     func registerEffect(_ effect: AudioEffect) -> Bool {
         codec.effects.insert(effect).inserted
@@ -70,18 +73,26 @@ final class IOAudioUnit: NSObject, IOUnit {
         codec.effects.remove(effect) != nil
     }
 
-    func appendSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-        guard let sampleBuffer = sampleBuffer.muted(muted) else {
-            return
+    private func isFragmented(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        if presentationTimeStamp == .invalid {
+            presentationTimeStamp = sampleBuffer.presentationTimeStamp
+            return false
         }
-        mixer?.recorder.appendSampleBuffer(sampleBuffer, mediaType: .audio)
-        codec.encodeSampleBuffer(sampleBuffer)
+        return presentationTimeStamp != sampleBuffer.presentationTimeStamp
+    }
+
+    private func makeSampleBuffer(_ buffer: CMSampleBuffer) -> CMSampleBuffer? {
+        let numSamples = min(Int(buffer.presentationTimeStamp.value - presentationTimeStamp.value), Int(presentationTimeStamp.timescale))
+        guard 0 < numSamples else {
+            return nil
+        }
+        return CMAudioSampleBufferUtil.makeSampleBuffer(buffer, numSamples: numSamples, presentationTimeStamp: presentationTimeStamp)
     }
 }
 
 extension IOAudioUnit: IOUnitEncoding {
     // MARK: IOUnitEncoding
-    func startEncoding(_ delegate: AVCodecDelegate) {
+    func startEncoding(_ delegate: any AVCodecDelegate) {
         codec.delegate = delegate
         codec.startRunning()
     }
@@ -89,15 +100,15 @@ extension IOAudioUnit: IOUnitEncoding {
     func stopEncoding() {
         codec.stopRunning()
         codec.delegate = nil
+        inSourceFormat = nil
     }
 }
 
 extension IOAudioUnit: IOUnitDecoding {
     // MARK: IOUnitDecoding
-    func startDecoding(_ audioEngine: AVAudioEngine) {
-        self.audioEngine = audioEngine
+    func startDecoding() {
         if let playerNode = mixer?.mediaLink.playerNode {
-            audioEngine.attach(playerNode)
+            mixer?.audioEngine?.attach(playerNode)
         }
         codec.delegate = self
         codec.startRunning()
@@ -105,11 +116,11 @@ extension IOAudioUnit: IOUnitDecoding {
 
     func stopDecoding() {
         if let playerNode = mixer?.mediaLink.playerNode {
-            audioEngine?.detach(playerNode)
+            mixer?.audioEngine?.detach(playerNode)
         }
-        audioEngine = nil
         codec.stopRunning()
         codec.delegate = nil
+        inSourceFormat = nil
     }
 }
 
@@ -127,45 +138,27 @@ extension IOAudioUnit: AVCaptureAudioDataOutputSampleBufferDelegate {
 
 extension IOAudioUnit: AudioCodecDelegate {
     // MARK: AudioConverterDelegate
-    func audioCodec(_ codec: AudioCodec, didSet formatDescription: CMFormatDescription?) {
-        guard let formatDescription = formatDescription, let audioEngine = audioEngine else {
-            return
-        }
-        audioFormat = AVAudioFormat(cmAudioFormatDescription: formatDescription)
-        nstry({
-            if let plyerNode = self.mixer?.mediaLink.playerNode, let audioFormat = self.audioFormat {
-                audioEngine.connect(plyerNode, to: audioEngine.mainMixerNode, format: audioFormat)
-            }
-        }, { exeption in
-            logger.warn(exeption)
-        })
+    func audioCodec(_ codec: AudioCodec, errorOccurred error: AudioCodec.Error) {
+    }
+
+    func audioCodec(_ codec: AudioCodec, didOutput audioFormat: AVAudioFormat) {
         do {
-            try audioEngine.start()
+            mixer?.audioFormat = audioFormat
+            if let audioEngine = mixer?.audioEngine, audioEngine.isRunning == false {
+                try audioEngine.start()
+            }
         } catch {
-            logger.warn(error)
+            logger.error(error)
         }
     }
 
-    func audioCodec(_ codec: AudioCodec, didOutput sample: UnsafeMutableAudioBufferListPointer, presentationTimeStamp: CMTime) {
-        guard !sample.isEmpty, sample[0].mDataByteSize != 0 else {
+    func audioCodec(_ codec: AudioCodec, didOutput audioBuffer: AVAudioBuffer, presentationTimeStamp: CMTime) {
+        guard let audioBuffer = audioBuffer as? AVAudioPCMBuffer else {
             return
-        }
-        guard
-            let audioFormat = audioFormat,
-            let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: sample[0].mDataByteSize / 4) else {
-            return
-        }
-        buffer.frameLength = buffer.frameCapacity
-        let bufferList = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-        for i in 0..<bufferList.count {
-            guard let mData = sample[i].mData else { continue }
-            memcpy(bufferList[i].mData, mData, Int(sample[i].mDataByteSize))
-            bufferList[i].mDataByteSize = sample[i].mDataByteSize
-            bufferList[i].mNumberChannels = 1
         }
         if let mixer = mixer {
-            mixer.delegate?.mixer(mixer, didOutput: buffer, presentationTimeStamp: presentationTimeStamp)
+            mixer.delegate?.mixer(mixer, didOutput: audioBuffer, presentationTimeStamp: presentationTimeStamp)
         }
-        mixer?.mediaLink.enqueueAudio(buffer)
+        mixer?.mediaLink.enqueueAudio(audioBuffer)
     }
 }

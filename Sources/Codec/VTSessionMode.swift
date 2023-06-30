@@ -5,15 +5,15 @@ enum VTSessionMode {
     case compression
     case decompression
 
-    func makeSession(_ videoCodec: VideoCodec) -> VTSessionConvertible? {
+    func makeSession(_ videoCodec: VideoCodec) -> (any VTSessionConvertible)? {
         switch self {
         case .compression:
             var session: VTCompressionSession?
             var status = VTCompressionSessionCreate(
                 allocator: kCFAllocatorDefault,
-                width: videoCodec.width,
-                height: videoCodec.height,
-                codecType: kCMVideoCodecType_H264,
+                width: videoCodec.settings.videoSize.width,
+                height: videoCodec.settings.videoSize.height,
+                codecType: videoCodec.settings.format.codecType,
                 encoderSpecification: nil,
                 imageBufferAttributes: videoCodec.attributes as CFDictionary?,
                 compressedDataAllocator: nil,
@@ -25,7 +25,7 @@ enum VTSessionMode {
                 videoCodec.delegate?.videoCodec(videoCodec, errorOccurred: .failedToCreate(status: status))
                 return nil
             }
-            status = session.setOptions(videoCodec.options())
+            status = session.setOptions(videoCodec.settings.options(videoCodec))
             guard status == noErr else {
                 videoCodec.delegate?.videoCodec(videoCodec, errorOccurred: .failedToPrepare(status: status))
                 return nil

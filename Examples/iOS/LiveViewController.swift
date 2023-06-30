@@ -26,13 +26,16 @@ final class LiveViewController: UIViewController {
     private var currentEffect: VideoEffect?
     private var currentPosition: AVCaptureDevice.Position = .back
     private var retryCount: Int = 0
+    private var videoBitRate = VideoCodecSettings.default.bitRate
 
     override func viewDidLoad() {
         super.viewDidLoad()
 
+        rtmpConnection.delegate = self
+
         pipIntentView.layer.borderWidth = 1.0
         pipIntentView.layer.borderColor = UIColor.white.cgColor
-        pipIntentView.bounds = MultiCamCaptureSetting.default.regionOfInterest
+        pipIntentView.bounds = MultiCamCaptureSettings.default.regionOfInterest
         pipIntentView.isUserInteractionEnabled = true
         view.addSubview(pipIntentView)
 
@@ -40,14 +43,25 @@ final class LiveViewController: UIViewController {
         if let orientation = DeviceUtil.videoOrientation(by: UIApplication.shared.statusBarOrientation) {
             rtmpStream.videoOrientation = orientation
         }
-        rtmpStream.videoSettings = [
-            .width: 720,
-            .height: 1280
-        ]
-        rtmpStream.mixer.recorder.delegate = self
 
-        videoBitrateSlider?.value = Float(RTMPStream.defaultVideoBitrate) / 1000
-        audioBitrateSlider?.value = Float(RTMPStream.defaultAudioBitrate) / 1000
+        rtmpStream.audioSettings = AudioCodecSettings(
+            bitRate: 64 * 1000
+        )
+
+        rtmpStream.videoSettings = VideoCodecSettings(
+            videoSize: .init(width: 854, height: 480),
+            profileLevel: kVTProfileLevel_H264_Baseline_3_1 as String,
+            bitRate: 640 * 1000,
+            maxKeyFrameIntervalDuration: 2,
+            scalingMode: .trim,
+            bitRateMode: .average,
+            allowFrameReordering: nil,
+            isHardwareEncoderEnabled: true
+        )
+
+        rtmpStream.mixer.recorder.delegate = self
+        videoBitrateSlider?.value = Float(VideoCodecSettings.default.bitRate) / 1000
+        audioBitrateSlider?.value = Float(AudioCodecSettings.default.bitRate) / 1000
 
         NotificationCenter.default.addObserver(self, selector: #selector(on(_:)), name: UIDevice.orientationDidChangeNotification, object: nil)
     }
@@ -64,6 +78,7 @@ final class LiveViewController: UIViewController {
         }
         if #available(iOS 13.0, *) {
             let front = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+            rtmpStream.videoCapture(for: 1)?.isVideoMirrored = true
             rtmpStream.attachMultiCamera(front)
         }
         rtmpStream.addObserver(self, forKeyPath: "currentFPS", options: .new, context: nil)
@@ -106,10 +121,11 @@ final class LiveViewController: UIViewController {
             currentFrame.origin.x += deltaX
             currentFrame.origin.y += deltaY
             pipIntentView.frame = currentFrame
-            rtmpStream.multiCamCaptureSettings = MultiCamCaptureSetting(
+            rtmpStream.multiCamCaptureSettings = MultiCamCaptureSettings(
                 mode: rtmpStream.multiCamCaptureSettings.mode,
                 cornerRadius: 16.0,
-                regionOfInterest: currentFrame
+                regionOfInterest: currentFrame,
+                direction: .east
             )
         }
     }
@@ -117,10 +133,12 @@ final class LiveViewController: UIViewController {
     @IBAction func rotateCamera(_ sender: UIButton) {
         logger.info("rotateCamera")
         let position: AVCaptureDevice.Position = currentPosition == .back ? .front : .back
+        rtmpStream.videoCapture(for: 0)?.isVideoMirrored = position == .front
         rtmpStream.attachCamera(AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)) { error in
             logger.warn(error)
         }
         if #available(iOS 13.0, *) {
+            rtmpStream.videoCapture(for: 1)?.isVideoMirrored = currentPosition == .front
             rtmpStream.attachMultiCamera(AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: currentPosition)) { error in
                 logger.warn(error)
             }
@@ -135,11 +153,11 @@ final class LiveViewController: UIViewController {
     @IBAction func on(slider: UISlider) {
         if slider == audioBitrateSlider {
             audioBitrateLabel?.text = "audio \(Int(slider.value))/kbps"
-            rtmpStream.audioSettings[.bitrate] = slider.value * 1000
+            rtmpStream.audioSettings.bitRate = Int(slider.value * 1000)
         }
         if slider == videoBitrateSlider {
             videoBitrateLabel?.text = "video \(Int(slider.value))/kbps"
-            rtmpStream.videoSettings[.bitrate] = slider.value * 1000
+            rtmpStream.videoSettings.bitRate = UInt32(slider.value * 1000)
         }
         if slider == zoomSlider {
             let zoomFactor = CGFloat(slider.value)
@@ -275,6 +293,26 @@ final class LiveViewController: UIViewController {
             return
         }
         rtmpStream.videoOrientation = orientation
+    }
+}
+
+extension LiveViewController: RTMPConnectionDelegate {
+    func connection(_ connection: RTMPConnection, publishInsufficientBWOccured stream: RTMPStream) {
+        // Adaptive bitrate streaming exsample. Please feedback me your good algorithm. :D
+        videoBitRate -= 32 * 1000
+        stream.videoSettings.bitRate = max(videoBitRate, 64 * 1000)
+    }
+
+    func connection(_ connection: RTMPConnection, publishSufficientBWOccured stream: RTMPStream) {
+        videoBitRate += 32 * 1000
+        stream.videoSettings.bitRate = min(videoBitRate, VideoCodecSettings.default.bitRate)
+    }
+
+    func connection(_ connection: RTMPConnection, updateStats stream: RTMPStream) {
+    }
+
+    func connection(_ connection: RTMPConnection, didClear stream: RTMPStream) {
+        videoBitRate = VideoCodecSettings.default.bitRate
     }
 }
 

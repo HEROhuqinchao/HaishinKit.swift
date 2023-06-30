@@ -12,11 +12,11 @@ protocol IOUnit {
 }
 
 protocol IOUnitEncoding {
-    func startEncoding(_ delegate: AVCodecDelegate)
+    func startEncoding(_ delegate: any AVCodecDelegate)
     func stopEncoding()
 }
 
 protocol IOUnitDecoding {
-    func startDecoding(_ audioEngine: AVAudioEngine)
+    func startDecoding()
     func stopDecoding()
 }

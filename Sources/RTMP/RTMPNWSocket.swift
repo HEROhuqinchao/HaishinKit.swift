@@ -14,7 +14,7 @@ final class RTMPNWSocket: RTMPSocketCompatible {
     var timeout: Int = NetSocket.defaultTimeout
     var readyState: RTMPSocketReadyState = .uninitialized {
         didSet {
-            delegate?.didSetReadyState(readyState)
+            delegate?.socket(self, readyState: readyState)
         }
     }
     var outputBufferSize: Int = RTMPNWSocket.defaultWindowSizeC
@@ -28,9 +28,9 @@ final class RTMPNWSocket: RTMPSocketCompatible {
             }
         }
     }
-    var qualityOfService: DispatchQoS = .default
+    var qualityOfService: DispatchQoS = .userInitiated
     var inputBuffer = Data()
-    weak var delegate: RTMPSocketDelegate?
+    weak var delegate: (any RTMPSocketDelegate)?
 
     private(set) var queueBytesOut: Atomic<Int64> = .init(0)
     private(set) var totalBytesIn: Atomic<Int64> = .init(0)
@@ -54,15 +54,16 @@ final class RTMPNWSocket: RTMPSocketCompatible {
     private var connection: NWConnection? {
         didSet {
             oldValue?.stateUpdateHandler = nil
-            oldValue?.forceCancel()
+            oldValue?.cancel()
             if connection == nil {
                 connected = false
+                readyState = .closed
             }
         }
     }
     private var parameters: NWParameters = .tcp
-    private lazy var inputQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.NWSocket.input", qos: qualityOfService)
-    private lazy var outputQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.NWSocket.output", qos: qualityOfService)
+    private lazy var inputQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.RTMPNWSocket.input", qos: qualityOfService)
+    private lazy var outputQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.RTMPNWSocket.output", qos: qualityOfService)
     private var timeoutHandler: DispatchWorkItem?
 
     func connect(withName: String, port: Int) {
@@ -93,7 +94,7 @@ final class RTMPNWSocket: RTMPSocketCompatible {
     }
 
     func close(isDisconnected: Bool) {
-        guard connection != nil else {
+        guard let connection else {
             return
         }
         if isDisconnected {
@@ -102,8 +103,17 @@ final class RTMPNWSocket: RTMPSocketCompatible {
             events.append(Event(type: .rtmpStatus, bubbles: false, data: data))
         }
         readyState = .closing
+        if connection.state == .ready {
+            outputQueue.async {
+                let completion: NWConnection.SendCompletion = .contentProcessed { (_: Error?) in
+                    self.connection = nil
+                }
+                connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: completion)
+            }
+        } else {
+            self.connection = nil
+        }
         timeoutHandler?.cancel()
-        connection = nil
     }
 
     @discardableResult
@@ -154,14 +164,24 @@ final class RTMPNWSocket: RTMPSocketCompatible {
     private func stateDidChange(to state: NWConnection.State) {
         switch state {
         case .ready:
+            logger.info("Connection is ready.")
             timeoutHandler?.cancel()
             connected = true
-        case .failed:
+        case .waiting(let error):
+            logger.warn("Connection waiting:", error)
+            close(isDisconnected: true)
+        case .setup:
+            logger.debug("Connection is setting up.")
+        case .preparing:
+            logger.debug("Connection is preparing.")
+        case .failed(let error):
+            logger.warn("Connection failed:", error)
             close(isDisconnected: true)
         case .cancelled:
+            logger.info("Connection cancelled.")
             close(isDisconnected: true)
-        default:
-            break
+        @unknown default:
+            logger.error("Unknown connection state.")
         }
     }
 
@@ -195,13 +215,13 @@ final class RTMPNWSocket: RTMPSocketCompatible {
             }
             inputBuffer.removeAll()
             readyState = .handshakeDone
-        case .handshakeDone:
+        case .handshakeDone, .closing:
             if inputBuffer.isEmpty {
                 break
             }
             let bytes: Data = inputBuffer
             inputBuffer.removeAll()
-            delegate?.listen(bytes)
+            delegate?.socket(self, data: bytes)
         default:
             break
         }

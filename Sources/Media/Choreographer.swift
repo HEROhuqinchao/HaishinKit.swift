@@ -7,18 +7,19 @@ typealias DisplayLink = CADisplayLink
 #endif
 
 protocol ChoreographerDelegate: AnyObject {
-    func choreographer(_ choreographer: Choreographer, didFrame duration: Double)
+    func choreographer(_ choreographer: any Choreographer, didFrame duration: Double)
 }
 
 protocol Choreographer: Running {
     var isPaused: Bool { get set }
-    var delegate: ChoreographerDelegate? { get set }
+    var delegate: (any ChoreographerDelegate)? { get set }
 
     func clear()
 }
 
 final class DisplayLinkChoreographer: NSObject, Choreographer {
-    static let defaultPreferredFramesPerSecond = 0
+    private static let duration = 0.0
+    private static let preferredFramesPerSecond = 0
 
     var isPaused: Bool {
         get {
@@ -28,9 +29,9 @@ final class DisplayLinkChoreographer: NSObject, Choreographer {
             displayLink?.isPaused = newValue
         }
     }
-    weak var delegate: ChoreographerDelegate?
+    weak var delegate: (any ChoreographerDelegate)?
     var isRunning: Atomic<Bool> = .init(false)
-    private var duration: Double = 0.0
+    private var duration: Double = DisplayLinkChoreographer.duration
     private var displayLink: DisplayLink? {
         didSet {
             oldValue?.invalidate()
@@ -38,13 +39,13 @@ final class DisplayLinkChoreographer: NSObject, Choreographer {
                 return
             }
             displayLink.isPaused = true
-            displayLink.preferredFramesPerSecond = Self.defaultPreferredFramesPerSecond
+            displayLink.preferredFramesPerSecond = Self.preferredFramesPerSecond
             displayLink.add(to: .main, forMode: .common)
         }
     }
 
     func clear() {
-        duration = 0.0
+        duration = Self.duration
     }
 
     @objc
@@ -62,7 +63,7 @@ extension DisplayLinkChoreographer: Running {
 
     func stopRunning() {
         displayLink = nil
-        duration = 0.0
+        duration = DisplayLinkChoreographer.duration
         isRunning.mutate { $0 = false }
     }
 }
