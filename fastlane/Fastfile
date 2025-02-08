@@ -15,12 +15,25 @@
 
 desc "[CI] Review PullRequest."
 lane :review do
-  spm
-  carthage(use_xcframeworks: true) if Helper.is_ci?
-  scan(scheme: 'Tests')
+  spm(
+    command: "test",
+    package_path: "HaishinKit",
+  )
+  spm(
+    command: "test",
+    package_path: "SRTHaishinKit",
+  )
+  begin
+    danger(
+      danger_id: 'danger',
+      dangerfile: 'Dangerfile',
+      verbose: true
+    )
+  rescue
+  end
 end
 
 desc "Creates documents."
 lane :document do
-  sh('cd ../ && swift package --allow-writing-to-directory ./docs generate-documentation --target HaishinKit --disable-indexing --hosting-base-path HaishinKit.swift --output-path ./docs')
+  sh('cd ../ && sourcekitten doc --spm --module-name HaishinKit > HaishinKit.json && sourcekitten doc --spm --module-name SRTHaishinKit > SRTHaishinKit.json && jazzy --sourcekitten-sourcefile HaishinKit.json,SRTHaishinKit.json')
 end
